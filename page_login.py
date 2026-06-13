@@ -12,7 +12,17 @@ def hash_password(p: str) -> str:
 
 def show_page():
 
-    logo_path = r"C:\Users\konek\Documents\UUM\sem 5\fyp\dataset\Organic Spices.png"
+    # ── Logo path — relative to this file so it works on any machine ──
+    # Place your logo file as 'logo.png' in the same folder as sims.py
+    import pathlib
+    _BASE = pathlib.Path(__file__).parent
+    logo_path = None
+    for _name in ('logo.png', 'logo.jpg', 'logo.jpeg',
+                  'Organic Spices.png', 'Organic_Spices.png'):
+        _p = _BASE / _name
+        if _p.exists():
+            logo_path = str(_p)
+            break
 
     st.markdown("""
         <style>
@@ -124,11 +134,13 @@ def show_page():
     with st.container():
         st.markdown('<div class="login-card-container"></div>', unsafe_allow_html=True)
 
-        if os.path.exists(logo_path):
+        if logo_path:
             st.image(logo_path, use_container_width=True)
         else:
-            st.markdown('<div style="font-size:60px;text-align:center;">🛡️</div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                '<div style="text-align:center;font-size:64px;margin-bottom:8px;">🌳</div>',
+                unsafe_allow_html=True
+            )
 
         st.markdown('<div class="welcome-msg">Welcome to the SIMS</div>',     unsafe_allow_html=True)
         st.markdown('<div class="signin-small">Sign in to your account</div>', unsafe_allow_html=True)

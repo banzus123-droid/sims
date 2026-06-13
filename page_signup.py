@@ -135,11 +135,24 @@ def show_page():
     with st.container():
         st.markdown('<div class="signup-card-container"></div>', unsafe_allow_html=True)
 
-        logo_path = r"C:\Users\konek\Documents\UUM\sem 5\fyp\dataset\Organic Spices.png"
-        if os.path.exists(logo_path):
+        # ── Logo — relative path, works on any machine ──
+        import pathlib
+        _BASE = pathlib.Path(__file__).parent
+        logo_path = None
+        for _name in ('logo.png', 'logo.jpg', 'logo.jpeg',
+                      'Organic Spices.png', 'Organic_Spices.png'):
+            _p = _BASE / _name
+            if _p.exists():
+                logo_path = str(_p)
+                break
+
+        if logo_path:
             st.image(logo_path, use_container_width=True)
         else:
-            st.image(r"C:\Users\konek\Documents\UUM\sem 5\fyp\dataset\Organic_Spices.png", use_container_width=True)
+            st.markdown(
+                '<div style="text-align:center;font-size:64px;margin-bottom:8px;">🌳</div>',
+                unsafe_allow_html=True
+            )
 
         st.markdown('<div class="welcome-msg">Create Account</div>',          unsafe_allow_html=True)
         st.markdown('<div class="signin-small">Register as an Analyst</div>', unsafe_allow_html=True)
