@@ -85,7 +85,10 @@ def show_page():
     """, unsafe_allow_html=True)
 
     # ── Load batch history from SQLite ─────────────────────
-    batches = db.get_batch_history()
+    # Load only this user's batches — not other users' history
+    _cur_user = st.session_state.get('current_user', {}) or {}
+    _username = _cur_user.get('username', None)
+    batches = db.get_batch_history(username=_username)
 
     if batches.empty:
         st.markdown("""

@@ -319,31 +319,47 @@ def save_analysis_batch(df, user_id=None, username=None) -> str:
 # ══════════════════════════════════════════════════════════════
 #  BATCH HISTORY  (History page)
 # ══════════════════════════════════════════════════════════════
-def get_batch_history():
+def get_batch_history(username: str = None):
+    """
+    Return analysis batches for a specific user only.
+    If username is provided, filter by analyst name so each
+    user sees only their own history — not other users batches.
+    """
     import pandas as pd
+    _cols = ["batch_id","analyzed_at","analyst",
+             "total_posts","high","moderate","low",
+             "avg_score","max_score"]
     if _SUPABASE_OK:
         try:
-            res = _sb.table("analysis_batches").select(
+            q = _sb.table("analysis_batches").select(
                 "batch_id,analyzed_at,analyst,"
                 "total_posts,high,moderate,low,avg_score,max_score"
-            ).order("analyzed_at", desc=True).execute()
+            )
+            if username:
+                q = q.eq("analyst", username)
+            q = q.order("analyzed_at", desc=True)
+            res = q.execute()
             if not res.data:
-                return pd.DataFrame(columns=[
-                    "batch_id","analyzed_at","analyst",
-                    "total_posts","high","moderate","low",
-                    "avg_score","max_score"
-                ])
+                return pd.DataFrame(columns=_cols)
             return pd.DataFrame(res.data)
         except Exception as e:
             print(f"[DB] get_batch_history error: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(columns=_cols)
 
     conn = _get_conn()
-    df = pd.read_sql_query("""
-        SELECT batch_id,analyzed_at,analyst,
-               total_posts,high,moderate,low,avg_score,max_score
-        FROM analysis_batches ORDER BY analyzed_at DESC
-    """, conn)
+    if username:
+        df = pd.read_sql_query("""
+            SELECT batch_id,analyzed_at,analyst,
+                   total_posts,high,moderate,low,avg_score,max_score
+            FROM analysis_batches WHERE analyst=?
+            ORDER BY analyzed_at DESC
+        """, conn, params=(username,))
+    else:
+        df = pd.read_sql_query("""
+            SELECT batch_id,analyzed_at,analyst,
+                   total_posts,high,moderate,low,avg_score,max_score
+            FROM analysis_batches ORDER BY analyzed_at DESC
+        """, conn)
     conn.close()
     return df
 
@@ -511,16 +527,23 @@ def get_posts_filtered(risk_category=None, min_score=0.0,
     conn.close()
     return df
 
-def get_post_stats() -> dict:
+def get_post_stats(username: str = None) -> dict:
+    """
+    Return summary KPIs for the dashboard.
+    Filtered by username so each user sees only their own data.
+    """
     import pandas as pd
+    _empty = {"total":0,"high":0,"moderate":0,"low":0,"avg_score":0.0}
     if _SUPABASE_OK:
         try:
-            res = _sb.table("analysis_batches").select(
+            q = _sb.table("analysis_batches").select(
                 "total_posts,high,moderate,low,avg_score"
-            ).execute()
-            df = pd.DataFrame(res.data)
+            )
+            if username:
+                q = q.eq("analyst", username)
+            df = pd.DataFrame(q.execute().data)
             if df.empty:
-                return {"total":0,"high":0,"moderate":0,"low":0,"avg_score":0.0}
+                return _empty
             return {
                 "total":     int(df["total_posts"].sum()),
                 "high":      int(df["high"].sum()),
@@ -530,25 +553,36 @@ def get_post_stats() -> dict:
             }
         except Exception as e:
             print(f"[DB] get_post_stats error: {e}")
-            return {"total":0,"high":0,"moderate":0,"low":0,"avg_score":0.0}
+            return _empty
 
     conn = _get_conn()
-    total = conn.execute("SELECT COUNT(*) FROM analyzed_posts").fetchone()[0]
-    by_cat = {r[0]:r[1] for r in conn.execute(
-        "SELECT risk_category,COUNT(*) FROM analyzed_posts GROUP BY risk_category"
-    ).fetchall()}
-    avg = conn.execute(
-        "SELECT AVG(risk_score) FROM analyzed_posts").fetchone()[0] or 0.0
+    if username:
+        total = conn.execute(
+            "SELECT COALESCE(SUM(total_posts),0) FROM analysis_batches WHERE analyst=?",
+            (username,)).fetchone()[0]
+        rows = conn.execute(
+            """SELECT SUM(high),SUM(moderate),SUM(low),AVG(avg_score)
+               FROM analysis_batches WHERE analyst=?""",
+            (username,)).fetchone()
+    else:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM analyzed_posts").fetchone()[0]
+        rows = conn.execute(
+            """SELECT
+                SUM(CASE WHEN risk_category='High Risk' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN risk_category='Moderate Risk' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN risk_category='Low Risk' THEN 1 ELSE 0 END),
+                AVG(risk_score)
+               FROM analyzed_posts""").fetchone()
     conn.close()
     return {
-        "total":total,
-        "high":by_cat.get("High Risk",0),
-        "moderate":by_cat.get("Moderate Risk",0),
-        "low":by_cat.get("Low Risk",0),
-        "avg_score":round(avg,4),
+        "total":    int(total or 0),
+        "high":     int(rows[0] or 0),
+        "moderate": int(rows[1] or 0),
+        "low":      int(rows[2] or 0),
+        "avg_score":round(float(rows[3] or 0.0), 4),
     }
 
-def clear_all_posts():
     if _SUPABASE_OK:
         try:
             _sb.table("analyzed_posts").delete().neq("id", 0).execute()

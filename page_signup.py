@@ -121,12 +121,7 @@ def show_page():
 
     st.markdown('<div style="margin-top:20px;"></div>', unsafe_allow_html=True)
 
-    # ══════════════════════════════════════════════════════════
-    #  FIX: Pre-initialise ALL session_state keys BEFORE any
-    #  widget or callback is declared. This guarantees the keys
-    #  exist when Streamlit fires on_change callbacks during the
-    #  first render pass, preventing the AttributeError.
-    # ══════════════════════════════════════════════════════════
+    # ── Pre-initialise ALL session_state keys BEFORE any widget ──
     _defaults = {
         'su_pwd_widget':  '',
         'su_pwd_clean':   '',
@@ -138,8 +133,6 @@ def show_page():
         if _k not in st.session_state:
             st.session_state[_k] = _v
 
-    # ── Callbacks — use .get() so they never crash even if
-    #    the widget key is momentarily absent ──────────────────
     def _clean_pwd():
         raw = st.session_state.get('su_pwd_widget', '')
         st.session_state['su_pwd_clean'] = "".join(
@@ -150,7 +143,6 @@ def show_page():
         st.session_state['su_cpwd_clean'] = "".join(
             c for c in raw if c.isdigit())[:8]
 
-    # ── Card ───────────────────────────────────────────────────
     with st.container():
         st.markdown('<div class="signup-card-container"></div>',
                     unsafe_allow_html=True)
@@ -176,8 +168,6 @@ def show_page():
                                  placeholder="e.g. nizar@gmail.com",
                                  key="su_email")
 
-        # Password widgets — keys pre-exist in session_state so
-        # on_change fires safely on EVERY render pass
         st.text_input(
             "Password (numbers only · max 8 digits)",
             type="password",
@@ -224,16 +214,13 @@ def show_page():
                             "Redirecting to sign in…"
                         )
                         import time; time.sleep(1.5)
-
                         for _k in ('su_pwd_widget', 'su_pwd_clean',
                                    'su_cpwd_widget', 'su_cpwd_clean',
                                    'su_username', 'su_email'):
                             st.session_state.pop(_k, None)
-
                         st.session_state['current_view'] = 'login'
                         st.rerun()
 
-        # Hidden back-to-login trigger
         if st.button("\u200B", key="btn_back_login"):
             st.session_state['current_view'] = 'login'
             st.rerun()
