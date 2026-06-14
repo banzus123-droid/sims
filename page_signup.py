@@ -123,19 +123,14 @@ def show_page():
             st.session_state[k] = v
 
     # Callbacks — only update shadow key, never write back to widget key
-def _clean_pwd():
-    pwd = st.session_state.get("su_pwd_widget", "")
-    st.session_state["su_pwd_clean"] = "".join(
-        c for c in pwd if c.isdigit()
-    )[:8]
+    def _clean_pwd():
+        st.session_state.su_pwd_clean = "".join(
+            c for c in st.session_state.su_pwd_widget if c.isdigit())[:8]
 
+    def _clean_cpwd():
+        st.session_state.su_cpwd_clean = "".join(
+            c for c in st.session_state.su_cpwd_widget if c.isdigit())[:8]
 
-def _clean_cpwd():
-    cpwd = st.session_state.get("su_cpwd_widget", "")
-    st.session_state["su_cpwd_clean"] = "".join(
-        c for c in cpwd if c.isdigit()
-    )[:8]
-    
     # ── Card ───────────────────────────────────────────────
     with st.container():
         st.markdown('<div class="signup-card-container"></div>', unsafe_allow_html=True)
