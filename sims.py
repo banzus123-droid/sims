@@ -96,24 +96,46 @@ for _mod, _pkg in {"wordcloud": "wordcloud",
     except ImportError:
         _OPTIONAL_MISSING.append(_pkg)
 
-# ── Google Drive model download (if GDRIVE_MODEL_ID is set) ─
-# Set this in your .env or Streamlit Cloud secrets:
-#   GDRIVE_MODEL_ID = your-google-drive-file-id
-_gdrive_id = os.environ.get("GDRIVE_MODEL_ID", "")
-if _gdrive_id:
-    os.makedirs("models", exist_ok=True)
-    if not os.path.exists("models/sims_pipeline.pkl"):
-        try:
-            import gdown as _gdown
-            print("[SIMS startup] Downloading model from Google Drive...")
-            _gdown.download(
-                f"https://drive.google.com/uc?id={_gdrive_id}",
-                "models/sims_pipeline.pkl",
-                quiet=False
-            )
-            print("[SIMS startup] Model downloaded successfully.")
-        except Exception as _e:
-            print(f"[SIMS startup] Model download failed: {_e}")
+# ── Google Drive model download ─────────────────────────────
+# Set these in Streamlit Cloud Secrets or your .env file:
+#   GDRIVE_PIPELINE_ID    = file ID of sims_pipeline.pkl
+#   GDRIVE_VECTORIZER_ID  = file ID of sims_tfidf_vectorizer.pkl
+#   GDRIVE_CLASSIFIER_ID  = file ID of sims_classifier.pkl
+#
+# How to get a file ID:
+#   1. Upload the .pkl file to Google Drive
+#   2. Right-click -> Share -> Anyone with the link -> Copy link
+#   3. The ID is the string between /d/ and /view in the link
+#      e.g. https://drive.google.com/file/d/1BxiMVs0XRA5nFM.../view
+#                                             ^^^^^^^^^^^^^^^^ this part
+def _get_env(key):
+    """Read from environment variables (covers both .env and Streamlit secrets)."""
+    return os.environ.get(key, "")
+
+os.makedirs("models", exist_ok=True)
+
+_MODEL_FILES = {
+    "models/sims_pipeline.pkl":         _get_env("GDRIVE_PIPELINE_ID"),
+    "models/sims_tfidf_vectorizer.pkl":  _get_env("GDRIVE_VECTORIZER_ID"),
+    "models/sims_classifier.pkl":        _get_env("GDRIVE_CLASSIFIER_ID"),
+}
+
+if any(_MODEL_FILES.values()):
+    try:
+        import gdown as _gdown
+        for _dest, _fid in _MODEL_FILES.items():
+            if _fid and not os.path.exists(_dest):
+                print(f"[SIMS startup] Downloading {os.path.basename(_dest)}...")
+                _gdown.download(
+                    f"https://drive.google.com/uc?id={_fid}",
+                    _dest,
+                    quiet=False
+                )
+                print(f"[SIMS startup] Done: {_dest}")
+    except ImportError:
+        print("[SIMS startup] gdown not installed - add it to requirements.txt")
+    except Exception as _e:
+        print(f"[SIMS startup] Model download error: {_e}")
 
 # ══════════════════════════════════════════════════════════
 #  NOW import streamlit — must be after all startup checks
