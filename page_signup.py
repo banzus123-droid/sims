@@ -1,17 +1,27 @@
+"""
+page_signup.py — SIMS_01 Sign Up
+Fixed: AttributeError on su_pwd_widget missing from session_state
+  → All widget keys are pre-initialised before ANY callback or widget runs.
+  → Callbacks now use .get() with a fallback instead of direct attribute access.
+"""
 import streamlit as st
 import streamlit.components.v1 as components
-import os
-import hashlib
+import pathlib
 
 import database as db
 
 
-def hash_password(p: str) -> str:
-    return hashlib.sha256(p.encode()).hexdigest()
-
-
 def show_page():
 
+    # ── Logo — relative path, works on any machine ─────────
+    _BASE = pathlib.Path(__file__).parent
+    logo_path = None
+    for _name in ('logo.png', 'logo.jpg', 'logo.jpeg',
+                  'Organic Spices.png', 'Organic_Spices.png'):
+        _p = _BASE / _name
+        if _p.exists():
+            logo_path = str(_p)
+            break
 
     st.markdown("""
         <style>
@@ -90,8 +100,6 @@ def show_page():
             transform: translateY(-2px);
             box-shadow: 0 8px 20px rgba(124,58,237,0.4) !important;
         }
-
-        /* ── Force ALL text black inside the signup card ── */
         *, *::before, *::after,
         p, span, div, li, a,
         h1, h2, h3, h4, h5, h6,
@@ -113,54 +121,63 @@ def show_page():
 
     st.markdown('<div style="margin-top:20px;"></div>', unsafe_allow_html=True)
 
-    # ── Session state ──────────────────────────────────────
-    for k, v in {
-        'su_pwd_widget': '', 'su_pwd_clean': '',
-        'su_cpwd_widget': '', 'su_cpwd_clean': '',
-        'current_view': 'login',
-    }.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    # ══════════════════════════════════════════════════════════
+    #  FIX: Pre-initialise ALL session_state keys BEFORE any
+    #  widget or callback is declared. This guarantees the keys
+    #  exist when Streamlit fires on_change callbacks during the
+    #  first render pass, preventing the AttributeError.
+    # ══════════════════════════════════════════════════════════
+    _defaults = {
+        'su_pwd_widget':  '',
+        'su_pwd_clean':   '',
+        'su_cpwd_widget': '',
+        'su_cpwd_clean':  '',
+        'current_view':   'login',
+    }
+    for _k, _v in _defaults.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
 
-    # Callbacks — only update shadow key, never write back to widget key
+    # ── Callbacks — use .get() so they never crash even if
+    #    the widget key is momentarily absent ──────────────────
     def _clean_pwd():
-        st.session_state.su_pwd_clean = "".join(
-            c for c in st.session_state.su_pwd_widget if c.isdigit())[:8]
+        raw = st.session_state.get('su_pwd_widget', '')
+        st.session_state['su_pwd_clean'] = "".join(
+            c for c in raw if c.isdigit())[:8]
 
     def _clean_cpwd():
-        st.session_state.su_cpwd_clean = "".join(
-            c for c in st.session_state.su_cpwd_widget if c.isdigit())[:8]
+        raw = st.session_state.get('su_cpwd_widget', '')
+        st.session_state['su_cpwd_clean'] = "".join(
+            c for c in raw if c.isdigit())[:8]
 
-    # ── Card ───────────────────────────────────────────────
+    # ── Card ───────────────────────────────────────────────────
     with st.container():
-        st.markdown('<div class="signup-card-container"></div>', unsafe_allow_html=True)
-
-        # ── Logo — relative path, works on any machine ──
-        import pathlib
-        _BASE = pathlib.Path(__file__).parent
-        logo_path = None
-        for _name in ('logo.png', 'logo.jpg', 'logo.jpeg',
-                      'Organic Spices.png', 'Organic_Spices.png'):
-            _p = _BASE / _name
-            if _p.exists():
-                logo_path = str(_p)
-                break
+        st.markdown('<div class="signup-card-container"></div>',
+                    unsafe_allow_html=True)
 
         if logo_path:
             st.image(logo_path, use_container_width=True)
         else:
             st.markdown(
-                '<div style="text-align:center;font-size:64px;margin-bottom:8px;">🌳</div>',
+                '<div style="text-align:center;font-size:64px;'
+                'margin-bottom:8px;">🌳</div>',
                 unsafe_allow_html=True
             )
 
-        st.markdown('<div class="welcome-msg">Create Account</div>',          unsafe_allow_html=True)
-        st.markdown('<div class="signin-small">Register as an Analyst</div>', unsafe_allow_html=True)
+        st.markdown('<div class="welcome-msg">Create Account</div>',
+                    unsafe_allow_html=True)
+        st.markdown('<div class="signin-small">Register as an Analyst</div>',
+                    unsafe_allow_html=True)
 
-        # Fields
-        username = st.text_input("Username",      placeholder="e.g. nizar_hakim")
-        email    = st.text_input("Email Address", placeholder="e.g. nizar@gmail.com")
+        username = st.text_input("Username",
+                                 placeholder="e.g. nizar_hakim",
+                                 key="su_username")
+        email    = st.text_input("Email Address",
+                                 placeholder="e.g. nizar@gmail.com",
+                                 key="su_email")
 
+        # Password widgets — keys pre-exist in session_state so
+        # on_change fires safely on EVERY render pass
         st.text_input(
             "Password (numbers only · max 8 digits)",
             type="password",
@@ -182,24 +199,23 @@ def show_page():
         with col_mid:
             if st.button("Create Account", use_container_width=True,
                          key="btn_create"):
-                pwd   = st.session_state.su_pwd_clean
-                cpwd  = st.session_state.su_cpwd_clean
+                pwd   = st.session_state.get('su_pwd_clean', '')
+                cpwd  = st.session_state.get('su_cpwd_clean', '')
                 uname = username.strip().lower()
+                eml   = email.strip()
 
-                # Validation
                 if not uname:
                     st.error("❌ Please enter a username.")
                 elif " " in uname:
                     st.error("❌ Username cannot contain spaces.")
-                elif not email.strip() or "@" not in email:
+                elif not eml or "@" not in eml:
                     st.error("❌ Please enter a valid email address.")
                 elif len(pwd) < 6:
                     st.error("❌ Password must be at least 6 digits.")
                 elif pwd != cpwd:
                     st.error("❌ Passwords do not match.")
                 else:
-                    # ── SQLite-backed account creation ──
-                    ok, msg = db.create_user(uname, email.strip(), pwd)
+                    ok, msg = db.create_user(uname, eml, pwd)
                     if not ok:
                         st.error(f"❌ {msg}")
                     else:
@@ -207,13 +223,12 @@ def show_page():
                             f"✅ Account created for **@{uname}**! "
                             "Redirecting to sign in…"
                         )
-
                         import time; time.sleep(1.5)
 
-                        # Delete widget keys — safe way to clear password fields
-                        for k in ('su_pwd_widget', 'su_pwd_clean',
-                                  'su_cpwd_widget', 'su_cpwd_clean'):
-                            st.session_state.pop(k, None)
+                        for _k in ('su_pwd_widget', 'su_pwd_clean',
+                                   'su_cpwd_widget', 'su_cpwd_clean',
+                                   'su_username', 'su_email'):
+                            st.session_state.pop(_k, None)
 
                         st.session_state['current_view'] = 'login'
                         st.rerun()
@@ -242,14 +257,12 @@ def show_page():
         unsafe_allow_html=True
     )
 
-    # ── JavaScript ─────────────────────────────────────────
     components.html("""
         <script>
         (function(){
             var doc=window.parent.document;
             function run(){
                 try{
-                    /* Numeric guard on password fields */
                     doc.querySelectorAll('input[type="password"]').forEach(function(inp){
                         if(inp._ng) return; inp._ng=true;
                         inp.addEventListener('keydown',function(e){
@@ -263,11 +276,10 @@ def show_page():
                         inp.addEventListener('paste',function(e){
                             e.preventDefault();
                             var d=(e.clipboardData||window.clipboardData)
-                                  .getData('text').replace(/\D/g,'').slice(0,8);
+                                  .getData('text').replace(/\\D/g,'').slice(0,8);
                             document.execCommand('insertText',false,d);
                         });
                     });
-                    /* Hide hidden back-to-login button */
                     var hb=null;
                     doc.querySelectorAll('button').forEach(function(b){
                         if(b.innerText==='\u200B'||b.textContent==='\u200B'){
@@ -278,7 +290,6 @@ def show_page():
                             if(ec) ec.style.cssText+=';display:none!important;height:0!important;overflow:hidden!important;margin:0!important;padding:0!important';
                         }
                     });
-                    /* Wire Sign in span */
                     var lk=doc.getElementById('sims-signin-link');
                     if(lk&&hb&&!lk._wired){
                         lk._wired=true;
