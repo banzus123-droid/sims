@@ -158,6 +158,20 @@ def init_db():
     if 'danger_score' not in {r[1] for r in cur.fetchall()}:
         cur.execute("ALTER TABLE analyzed_posts ADD COLUMN danger_score REAL")
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_batches (
+            batch_id     TEXT PRIMARY KEY,
+            analyzed_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            analyst      TEXT DEFAULT '—',
+            user_id      INTEGER,
+            total_posts  INTEGER DEFAULT 0,
+            high         INTEGER DEFAULT 0,
+            moderate     INTEGER DEFAULT 0,
+            low          INTEGER DEFAULT 0,
+            avg_score    REAL    DEFAULT 0.0,
+            max_score    REAL    DEFAULT 0.0
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             event_type TEXT NOT NULL,
@@ -301,14 +315,26 @@ def authenticate(username: str, password: str) -> dict | None:
 # ════════════════════════════════════════════════════════════
 #  ANALYZED POSTS FUNCTIONS  (SIMS_07, SIMS_08, SIMS_09)
 # ════════════════════════════════════════════════════════════
-def save_analysis_batch(df, user_id=None) -> str:
+def save_analysis_batch(df, user_id=None, username=None) -> str:
     """
     SIMS_07 — Save a batch of analyzed posts to the database.
+    Also writes a summary record to analysis_batches so that
+    History page can retrieve it after logout/login.
     Returns the batch_id string.
     """
     import pandas as pd
-    batch_id = f"batch_{int(time.time())}"
+    batch_id  = f"batch_{int(time.time())}"
+    analyst   = username or "—"
 
+    # ── Build summary stats ─────────────────────────────────
+    total = len(df)
+    high  = int((df['Risk_Category'] == 'High Risk').sum())
+    mod   = int((df['Risk_Category'] == 'Moderate Risk').sum())
+    low   = int((df['Risk_Category'] == 'Low Risk').sum())
+    avg   = round(float(df['Risk_Score'].mean()), 4) if total else 0.0
+    mx    = round(float(df['Risk_Score'].max()),  4) if total else 0.0
+
+    # ── Build rows for analyzed_posts ───────────────────────
     rows = []
     for _, r in df.iterrows():
         danger = r.get('Danger_Score', None)
@@ -331,11 +357,25 @@ def save_analysis_batch(df, user_id=None) -> str:
 
     if _SUPABASE_OK:
         try:
-            # Supabase insert in chunks of 500 to avoid payload size limits
+            # ── Insert posts in chunks of 500 ───────────────
             chunk_size = 500
             for i in range(0, len(rows), chunk_size):
                 _sb.table("analyzed_posts") \
                    .insert(rows[i:i+chunk_size]).execute()
+
+            # ── Insert batch summary ─────────────────────────
+            _sb.table("analysis_batches").insert({
+                "batch_id":    batch_id,
+                "analyst":     analyst,
+                "user_id":     user_id,
+                "total_posts": total,
+                "high":        high,
+                "moderate":    mod,
+                "low":         low,
+                "avg_score":   avg,
+                "max_score":   mx,
+            }).execute()
+
         except Exception as e:
             print(f"[DB] save_analysis_batch error: {e}")
         return batch_id
@@ -350,6 +390,13 @@ def save_analysis_batch(df, user_id=None) -> str:
           (:batch_id,:user_id,:original_text,:preprocessed,
            :risk_score,:risk_category,:danger_score,:source,:post_timestamp)
     """, rows)
+    # Insert batch summary for SQLite too
+    conn.execute("""
+        INSERT OR REPLACE INTO analysis_batches
+          (batch_id, analyst, total_posts, high, moderate,
+           low, avg_score, max_score)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (batch_id, analyst, total, high, mod, low, avg, mx))
     conn.commit()
     conn.close()
     return batch_id
@@ -531,59 +578,41 @@ def clear_all_posts():
 #  BATCH HISTORY FUNCTIONS
 # ════════════════════════════════════════════════════════════
 def get_batch_history():
-    """Return a DataFrame summarising each saved analysis batch."""
+    """
+    Return a DataFrame summarising each saved analysis batch.
+    Reads from the analysis_batches summary table which is
+    written by save_analysis_batch() — persists across logout/login.
+    """
     import pandas as pd
 
     if _SUPABASE_OK:
         try:
-            res = _sb.table("analyzed_posts").select(
-                "batch_id,user_id,risk_category,risk_score,analyzed_at"
+            res = _sb.table("analysis_batches").select(
+                "batch_id,analyzed_at,analyst,"
+                "total_posts,high,moderate,low,"
+                "avg_score,max_score"
             ).order("analyzed_at", desc=True).execute()
-            df = pd.DataFrame(res.data)
-            if df.empty:
+
+            if not res.data:
                 return pd.DataFrame(columns=[
                     'batch_id','analyzed_at','analyst',
                     'total_posts','high','moderate','low',
                     'avg_score','max_score'
                 ])
-            # Aggregate in Python
-            agg = []
-            for batch_id, grp in df.groupby('batch_id'):
-                agg.append({
-                    'batch_id':    batch_id,
-                    'analyzed_at': grp['analyzed_at'].min(),
-                    'analyst':     '—',
-                    'total_posts': len(grp),
-                    'high':    (grp['risk_category']=='High Risk').sum(),
-                    'moderate':(grp['risk_category']=='Moderate Risk').sum(),
-                    'low':     (grp['risk_category']=='Low Risk').sum(),
-                    'avg_score':round(grp['risk_score'].mean(),4),
-                    'max_score':round(grp['risk_score'].max(),4),
-                })
-            result = pd.DataFrame(agg).sort_values(
-                'analyzed_at', ascending=False).reset_index(drop=True)
-            return result
+            return pd.DataFrame(res.data)
+
         except Exception as e:
             print(f"[DB] get_batch_history error: {e}")
             return pd.DataFrame()
 
-    # SQLite fallback
+    # ── SQLite fallback ─────────────────────────────────────
     import pandas as pd
     conn = _get_conn()
     df = pd.read_sql_query("""
-        SELECT
-            ap.batch_id,
-            MIN(ap.analyzed_at) AS analyzed_at,
-            COALESCE(u.username,'—') AS analyst,
-            COUNT(*) AS total_posts,
-            SUM(CASE WHEN ap.risk_category='High Risk' THEN 1 ELSE 0 END) AS high,
-            SUM(CASE WHEN ap.risk_category='Moderate Risk' THEN 1 ELSE 0 END) AS moderate,
-            SUM(CASE WHEN ap.risk_category='Low Risk' THEN 1 ELSE 0 END) AS low,
-            ROUND(AVG(ap.risk_score),4) AS avg_score,
-            ROUND(MAX(ap.risk_score),4) AS max_score
-        FROM analyzed_posts ap
-        LEFT JOIN users u ON ap.user_id=u.id
-        GROUP BY ap.batch_id
+        SELECT batch_id, analyzed_at, analyst,
+               total_posts, high, moderate, low,
+               avg_score, max_score
+        FROM analysis_batches
         ORDER BY analyzed_at DESC
     """, conn)
     conn.close()

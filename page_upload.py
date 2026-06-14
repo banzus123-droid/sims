@@ -17,8 +17,14 @@ def show_page(logic):
 
     model_ready = logic is not None and logic.is_ready
 
-    # Auto-hydration removed — analyzed_df is cleared on login (sims.py).
-    # Users must explicitly load a batch from History or upload new data.
+    # Hydrate analyzed_df from SQLite if session is empty (persistence across restarts)
+    if st.session_state.get('analyzed_df') is None:
+        try:
+            persisted = db.get_all_posts()
+            if not persisted.empty:
+                st.session_state['analyzed_df'] = persisted
+        except Exception:
+            pass
 
     st.markdown("""
         <style>
@@ -339,29 +345,19 @@ def _run_pipeline(df: pd.DataFrame, logic):
         probs, predictions = logic.predict_proba_batch(
             df_work['Preprocessed'].tolist()
         )
-        # ── Risk_Score: model confidence in predicted class ────────────────
-        # Standard probabilistic classifier output (Breiman, 2001;
-        # scikit-learn predict_proba documentation).
+        # Risk_Score = model confidence in its predicted class (0.0–1.0)
+        # Kept for backward compatibility — represents how sure the model is.
         df_work['Risk_Score']    = np.max(probs, axis=1).round(4)
-
         labels = {0: 'Low Risk', 1: 'Moderate Risk', 2: 'High Risk'}
         df_work['Risk_Category'] = [labels[p] for p in predictions]
 
-        # ── Danger_Score: ordinal expected value (0.0 = safe, 1.0 = danger) ─
-        # Formula: E[class] / max_class_index
-        # = (p(Low)×0 + p(Moderate)×1 + p(High)×2) / 2
-        #
-        # Source: Frank, E., & Hall, M. (2001). A simple approach to ordinal
-        # classification. Machine Learning: ECML 2001, Lecture Notes in
-        # Computer Science, vol 2167, pp. 145–156. Springer.
-        #
-        # Justification: Treats Low/Moderate/High as ordinal classes
-        # (0, 1, 2). The expected class index, normalised by the maximum
-        # index (2), gives a principled 0–1 danger score grounded in
-        # ordinal classification theory. Low Risk → ~0.0, High Risk → ~1.0.
+        # Danger_Score = weighted danger meter (0.0 = safe, 1.0 = high danger)
+        # Aligns with proposal: "Risk score range: 0.0 (safe) to 1.0 (high risk)"
+        # Formula: P(High)*1.0 + P(Moderate)*0.5 + P(Low)*0.0
         if probs.shape[1] >= 3:
-            danger = (probs[:, 0] * 0 + probs[:, 1] * 1 + probs[:, 2] * 2) / 2
+            danger = probs[:, 2] * 1.0 + probs[:, 1] * 0.5 + probs[:, 0] * 0.0
         else:
+            # Fallback for unexpected shapes — use raw confidence
             danger = np.max(probs, axis=1)
         df_work['Danger_Score'] = np.round(danger, 4)
     except Exception as e:
@@ -374,7 +370,11 @@ def _run_pipeline(df: pd.DataFrame, logic):
     # SIMS_07 — also persist to SQLite (FR 1.3 — database storage)
     try:
         user_for_save = st.session_state.get('current_user', {}) or {}
-        batch_id = db.save_analysis_batch(df_work, user_id=user_for_save.get('id'))
+        batch_id = db.save_analysis_batch(
+            df_work,
+            user_id=user_for_save.get('id'),
+            username=user_for_save.get('username', '—')
+        )
     except Exception as e:
         st.warning(f"⚠️ Could not save to database: {e}")
         batch_id = None
