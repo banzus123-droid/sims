@@ -1,46 +1,145 @@
 """
-app.py — SIMS Entry Point
-Run with: streamlit run app.py
+sims.py — SIMS Entry Point
+Run with: streamlit run sims.py
 
 Proposal mapping:
   SIMS_01  Sign Up        → page_signup.show_page()
   SIMS_02  Login          → page_login.show_page()
   SIMS_03  Dashboard      → page_dashboard.show_page()
-  SIMS_04–07 Upload/ML   → page_upload.show_page(logic)
-  SIMS_08–09 Filter/CSV  → page_analysis.show_page()
+  SIMS_04-07 Upload/ML   → page_upload.show_page(logic)
+  SIMS_08-09 Filter/CSV  → page_analysis.show_page()
   FR 2.3   Trends        → page_trends.show_page()
   SIMS_10  Logout         → sidebar button
-  NFR 1.1  Hashed pwds   → logic handled in page_login / page_signup
-  NFR 1.2  Audit log     → session_state['audit_log']
+  NFR 1.1  Hashed pwds   → database.py (bcrypt)
+  NFR 1.2  Audit log     → database.py (audit_log table)
 """
 
-import streamlit as st
-import hashlib
-import time
+# ══════════════════════════════════════════════════════════
+#  STEP 0 — STARTUP SAFETY CHECKS
+#  Must run BEFORE importing streamlit or any other module.
+#  Streamlit Cloud, Colab, and fresh installs all need
+#  NLTK corpora downloaded at startup explicitly.
+#  Other packages are checked here so the app shows a clear
+#  human-readable error instead of a cryptic import crash.
+# ══════════════════════════════════════════════════════════
 import os
+import sys
 
-# ── Page modules ──────────────────────────────────────────
-import page_login
-import page_signup
-import page_dashboard
-import page_upload
-import page_analysis
-import page_trends
-import page_history
-
-# ── Database layer (SQLite) ───────────────────────────────
-import database as db
-
-
-# ── ML backend ────────────────────────────────────────────
+# ── Load .env file (for local development and Colab) ───────
 try:
-    from logic import SIMSLogic
-except Exception as e:
-    st.error(f"❌ Could not import SIMSLogic: {e}")
-    st.stop()
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed — env vars set manually
+
+# ── NLTK corpora download ───────────────────────────────────
+# Must happen before logic.py is imported because logic.py
+# imports nltk at module level. If corpora are missing, the
+# SIMSLogic class will crash on instantiation.
+#
+# Corpora used (with academic citations):
+#   stopwords  — Bird, Klein & Loper (2009). NLTK Book. O'Reilly.
+#   wordnet    — Miller (1995). WordNet. Comms ACM 38(11).
+#   punkt      — Kiss & Strunk (2006). Comp. Linguistics 32(4).
+#   omw-1.4    — Bond & Foster (2013). ACL 2013.
+try:
+    import nltk as _nltk_startup
+    _nltk_dir = os.path.expanduser("~/nltk_data")
+    os.makedirs(_nltk_dir, exist_ok=True)
+
+    _CORPORA = {
+        "stopwords": "corpora",
+        "wordnet":   "corpora",
+        "omw-1.4":   "corpora",
+        "punkt":     "tokenizers",
+        "punkt_tab": "tokenizers",
+    }
+    for _corpus, _category in _CORPORA.items():
+        try:
+            _nltk_startup.data.find(f"{_category}/{_corpus}")
+        except LookupError:
+            print(f"[SIMS startup] Downloading NLTK corpus: {_corpus}")
+            _nltk_startup.download(
+                _corpus, quiet=True, download_dir=_nltk_dir
+            )
+    print("[SIMS startup] NLTK corpora ready.")
+except ImportError:
+    print("[SIMS startup] NLTK not installed — keyword fallback will be used.")
+except Exception as _e:
+    print(f"[SIMS startup] NLTK warning: {_e}")
+
+# ── Check all required packages are installed ───────────────
+_REQUIRED = {
+    "streamlit":  "streamlit",
+    "pandas":     "pandas",
+    "numpy":      "numpy",
+    "sklearn":    "scikit-learn",
+    "nltk":       "nltk",
+    "joblib":     "joblib",
+    "altair":     "altair",
+    "bcrypt":     "bcrypt",
+}
+_MISSING = []
+for _mod, _pkg in _REQUIRED.items():
+    try:
+        __import__(_mod)
+    except ImportError:
+        _MISSING.append(_pkg)
+
+# ── Optional packages (warn but do not stop) ───────────────
+_OPTIONAL_MISSING = []
+for _mod, _pkg in {"wordcloud": "wordcloud",
+                    "supabase":  "supabase",
+                    "gdown":     "gdown"}.items():
+    try:
+        __import__(_mod)
+    except ImportError:
+        _OPTIONAL_MISSING.append(_pkg)
+
+# ── Google Drive model download (if GDRIVE_MODEL_ID is set) ─
+# Set this in your .env or Streamlit Cloud secrets:
+#   GDRIVE_MODEL_ID = your-google-drive-file-id
+_gdrive_id = os.environ.get("GDRIVE_MODEL_ID", "")
+if _gdrive_id:
+    os.makedirs("models", exist_ok=True)
+    if not os.path.exists("models/sims_pipeline.pkl"):
+        try:
+            import gdown as _gdown
+            print("[SIMS startup] Downloading model from Google Drive...")
+            _gdown.download(
+                f"https://drive.google.com/uc?id={_gdrive_id}",
+                "models/sims_pipeline.pkl",
+                quiet=False
+            )
+            print("[SIMS startup] Model downloaded successfully.")
+        except Exception as _e:
+            print(f"[SIMS startup] Model download failed: {_e}")
 
 # ══════════════════════════════════════════════════════════
-#  PAGE CONFIG  (must be the very first Streamlit call)
+#  NOW import streamlit — must be after all startup checks
+# ══════════════════════════════════════════════════════════
+import streamlit as st
+import time
+
+# ── Show missing package error immediately after st loads ──
+if _MISSING:
+    st.set_page_config(page_title="SIMS — Setup Required", layout="centered")
+    st.error(
+        f"❌ **Missing required packages:** `{', '.join(_MISSING)}`\n\n"
+        "Run this command in your terminal then restart the app:\n\n"
+        f"```\npip install {' '.join(_MISSING)}\n```"
+    )
+    st.stop()
+
+if _OPTIONAL_MISSING:
+    # Don't stop — just warn in the terminal
+    print(f"[SIMS startup] Optional packages not installed: "
+          f"{', '.join(_OPTIONAL_MISSING)}")
+    print(f"[SIMS startup] Install with: pip install "
+          f"{' '.join(_OPTIONAL_MISSING)}")
+
+# ══════════════════════════════════════════════════════════
+#  PAGE CONFIG — must be first Streamlit call after import
 # ══════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="SIMS | Suicidal Ideation Monitoring System",
@@ -48,15 +147,36 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ══════════════════════════════════════════════════════════
-#  DATABASE INIT — creates sims.db on first run, seeds admin
-# ══════════════════════════════════════════════════════════
-if 'db_initialized' not in st.session_state:
-    db.init_db()
-    st.session_state['db_initialized'] = True
+# ── Page modules ────────────────────────────────────────────
+import page_login
+import page_signup
+import page_dashboard
+import page_upload
+import page_analysis
+import page_trends
+import page_history
+import database as db
+
+# ── ML backend ──────────────────────────────────────────────
+try:
+    from logic import SIMSLogic
+except Exception as _e:
+    st.error(
+        f"❌ Could not import SIMSLogic: {_e}\n\n"
+        "Make sure `logic.py` is in your project folder and all "
+        "packages in `requirements.txt` are installed."
+    )
+    st.stop()
 
 # ══════════════════════════════════════════════════════════
-#  GLOBAL CSS — dark theme shared across dashboard pages
+#  DATABASE INIT
+# ══════════════════════════════════════════════════════════
+if "db_initialized" not in st.session_state:
+    db.init_db()
+    st.session_state["db_initialized"] = True
+
+# ══════════════════════════════════════════════════════════
+#  GLOBAL CSS — dark theme shared across all dashboard pages
 # ══════════════════════════════════════════════════════════
 st.markdown("""
     <style>
@@ -66,8 +186,6 @@ st.markdown("""
     h1, h2, h3, h4 {
         font-family: 'Plus Jakarta Sans', sans-serif !important;
     }
-
-    /* Background is set per-page */
 
     /* Sidebar */
     section[data-testid="stSidebar"] {
@@ -84,12 +202,12 @@ st.markdown("""
         padding: 1rem !important;
     }
     [data-testid="stMetricValue"] {
-        color: #a78bfa !important;
+        color: #FFFFFF !important;
         font-weight: 800 !important;
     }
     [data-testid="stMetricLabel"] { color: #94a3b8 !important; }
 
-    /* Buttons — purple */
+    /* Buttons */
     .stButton > button, .stDownloadButton > button {
         background: linear-gradient(135deg,#7c3aed 0%,#6d28d9 100%) !important;
         color: #fff !important;
@@ -111,17 +229,6 @@ st.markdown("""
         border-radius: 8px !important;
     }
 
-    /* Tabs */
-    div[data-testid="stTabs"] button {
-        color: #ffffff !important;
-        font-weight: 600 !important;
-        background: transparent !important;
-    }
-    div[data-testid="stTabs"] button[aria-selected="true"] {
-        color: #ffffff !important;
-        border-bottom-color: #7c3aed !important;
-    }
-
     /* Dataframe */
     [data-testid="stDataFrame"] { border-radius: 10px !important; }
 
@@ -133,8 +240,7 @@ st.markdown("""
     ::-webkit-scrollbar-track { background: #0F172A; }
     ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
 
-    /* ── White text for dark pages ONLY (not login/signup) ── */
-    /* Triggered by the dark app background set on dashboard/upload/analysis/trends */
+    /* White text for dark pages */
     [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) p,
     [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) span,
     [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) li,
@@ -145,18 +251,6 @@ st.markdown("""
     }
     [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) label,
     [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) [data-testid="stWidgetLabel"] p,
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .stTextInput label,
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .stSelectbox label,
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .stMultiSelect label,
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .stRadio label,
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .stCheckbox label,
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .stFileUploader label {
-        color: #F1F5F9 !important;
-    }
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) [data-baseweb="select"] [data-baseweb="value"],
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .stRadio div label p,
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .stCheckbox div label p,
-    [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) .streamlit-expanderHeader,
     [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) h1,
     [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) h2,
     [data-testid="stAppViewContainer"]:not(:has(.login-card-container)):not(:has(.signup-card-container)) h3,
@@ -167,62 +261,57 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
-#  SESSION STATE — initialise all keys once at startup
+#  SESSION STATE
 # ══════════════════════════════════════════════════════════
 _DEFAULTS = {
-    # Auth
-    'logged_in':      False,
-    'current_user':   None,
-    'current_view':   'login',      # 'login' | 'signup'
-    # Navigation
-    'active_page':    'Dashboard',
-    # Data
-    'raw_df':         None,
-    'analyzed_df':    None,
-    # Tracks which batch is currently loaded in analyzed_df.
-    # Set when user loads a batch from History, or after a new upload.
-    # Cleared to None when that batch is deleted.
-    'active_batch_id': None,
-    # Audit log (NFR 1.2) — kept for legacy in-session display only;
-    # the authoritative audit log is in SQLite (see database.py)
-    'audit_log':      [],
-    '_login_logged':  False,
+    "logged_in":       False,
+    "current_user":    None,
+    "current_view":    "login",
+    "active_page":     "Dashboard",
+    "raw_df":          None,
+    "analyzed_df":     None,
+    "active_batch_id": None,
+    "audit_log":       [],
+    "_login_logged":   False,
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ══════════════════════════════════════════════════════════
-#  BACKEND — load once, cache for the session
+#  LOAD ML BACKEND — cached for the whole session
 # ══════════════════════════════════════════════════════════
 @st.cache_resource(show_spinner="Loading SIMS AI engine…")
 def _load_logic():
-    for path in ['models/sims_pipeline.pkl', 'sims_pipeline.pkl']:
-        if os.path.exists(path):
-            return SIMSLogic()
-    # Returns with pipeline=None — pages handle gracefully
     return SIMSLogic()
 
 try:
     logic = _load_logic()
-except Exception as e:
-    st.warning(f"⚠️ AI engine error: {e}. Some features may be unavailable.")
+except Exception as _e:
+    st.warning(
+        f"⚠️ AI engine could not load: {_e}\n\n"
+        "The keyword fallback classifier will be used instead. "
+        "Upload your `.pkl` model files to the `models/` folder "
+        "to enable full ML classification."
+    )
     logic = None
 
 # ══════════════════════════════════════════════════════════
-#  SIDEBAR  (shown only when logged in)
+#  NAV PAGES
 # ══════════════════════════════════════════════════════════
 NAV_PAGES = [
-    ("Dashboard",   "📊"),
-    ("Upload",      "📤"),
-    ("Analysis",    "🔍"),
-    ("Trends",      "📈"),
-    ("History",     "🕒"),
+    ("Dashboard", "📊"),
+    ("Upload",    "📤"),
+    ("Analysis",  "🔍"),
+    ("Trends",    "📈"),
+    ("History",   "🕒"),
 ]
 
+# ══════════════════════════════════════════════════════════
+#  SIDEBAR
+# ══════════════════════════════════════════════════════════
 def _render_sidebar():
     with st.sidebar:
-        # Brand — plain text
         st.markdown("""
             <div style='text-align:center;padding:1rem 0 0.5rem;'>
                 <div style='font-size:0.65rem;color:#ffffff;font-weight:700;
@@ -235,25 +324,25 @@ def _render_sidebar():
         st.divider()
 
         # User badge
-        user = st.session_state['current_user'] or {}
+        user = st.session_state["current_user"] or {}
         st.markdown(f"""
             <div style='background:#1e293b;border:1px solid #334155;
                         border-radius:10px;padding:10px 12px;margin-bottom:1rem;'>
-                <div style='font-size:0.65rem;color:#7c3aed;font-weight:700;
+                <div style='font-size:0.65rem;color:#94a3b8;font-weight:700;
                             text-transform:uppercase;letter-spacing:1px;'>
-                    {user.get('role','Analyst')}
+                    {user.get("role","Analyst")}
                 </div>
                 <div style='font-weight:800;color:#f1f5f9;font-size:0.88rem;
                             margin-top:2px;'>
-                    @{user.get('username','—')}
+                    @{user.get("username","—")}
                 </div>
                 <div style='font-size:0.7rem;color:#475569;margin-top:1px;'>
-                    {user.get('email','—')}
+                    {user.get("email","—")}
                 </div>
             </div>
         """, unsafe_allow_html=True)
 
-        # Navigation — active state via CSS only, no wrapper divs
+        # Navigation
         st.markdown(
             "<div style='font-size:0.65rem;color:#475569;font-weight:700;"
             "text-transform:uppercase;letter-spacing:1.5px;"
@@ -261,14 +350,7 @@ def _render_sidebar():
             unsafe_allow_html=True
         )
 
-        active_page = st.session_state['active_page']
-
-        # Inject one CSS block — base style for all nav buttons,
-        # plus active override for the current page's button key.
-        # Streamlit renders each st.button with a wrapping element
-        # that carries data-testid="stBaseButton-{key}", which lets
-        # us target the active button without any wrapper divs.
-        active_key = f"nav_{active_page}"
+        active_key = f"nav_{st.session_state['active_page']}"
         st.markdown(f"""
             <style>
             div[data-testid="stSidebar"] button[kind="secondary"] {{
@@ -297,7 +379,7 @@ def _render_sidebar():
                 key=f"nav_{page_name}",
                 use_container_width=True
             ):
-                st.session_state['active_page'] = page_name
+                st.session_state["active_page"] = page_name
                 st.rerun()
 
         st.divider()
@@ -320,10 +402,12 @@ def _render_sidebar():
         """, unsafe_allow_html=True)
 
         # Dataset status
-        has_data = st.session_state.get('analyzed_df') is not None
+        has_data = st.session_state.get("analyzed_df") is not None
         d_colour = "#22c55e" if has_data else "#64748b"
-        d_label  = f"{len(st.session_state['analyzed_df']):,} posts analysed" \
-                   if has_data else "No dataset loaded"
+        d_label  = (
+            f"{len(st.session_state['analyzed_df']):,} posts loaded"
+            if has_data else "No dataset loaded"
+        )
         st.markdown(f"""
             <div style='background:#0f172a;border:1px solid {d_colour}33;
                         border-radius:8px;padding:8px 10px;
@@ -339,72 +423,52 @@ def _render_sidebar():
 
         # Logout — SIMS_10
         if st.button("🚪 Logout", use_container_width=True, key="btn_logout"):
-            # Log to SQLite (NFR 1.2)
             db.log_event(
-                'logout',
-                user.get('username', '—'),
-                'User logged out',
+                "logout",
+                user.get("username", "—"),
+                "User logged out",
                 success=True
             )
-            # Keep legacy in-session log for backward compatibility
-            st.session_state['audit_log'].append({
-                'event': 'logout',
-                'user':  user.get('username', '—'),
-                'time':  time.strftime('%Y-%m-%d %H:%M:%S')
+            st.session_state["audit_log"].append({
+                "event": "logout",
+                "user":  user.get("username", "—"),
+                "time":  time.strftime("%Y-%m-%d %H:%M:%S")
             })
-            for k in ('logged_in','current_user','raw_df',
-                      'analyzed_df','active_batch_id','_login_logged'):
+            for k in ("logged_in", "current_user", "raw_df",
+                      "analyzed_df", "active_batch_id", "_login_logged"):
                 st.session_state[k] = (
-                    False if k == 'logged_in' else None
+                    False if k == "logged_in" else None
                 )
-            st.session_state['current_view'] = 'login'
+            st.session_state["current_view"] = "login"
             st.rerun()
 
 # ══════════════════════════════════════════════════════════
 #  MAIN ROUTER
 # ══════════════════════════════════════════════════════════
-if not st.session_state['logged_in']:
-    # ── Auth flow ─────────────────────────────────────────
-    if st.session_state['current_view'] == 'signup':
-        page_signup.show_page()          # SIMS_01
+if not st.session_state["logged_in"]:
+    if st.session_state["current_view"] == "signup":
+        page_signup.show_page()      # SIMS_01
     else:
-        page_login.show_page()           # SIMS_02
+        page_login.show_page()       # SIMS_02
 
 else:
-    # ── Audit: log first login per session (NFR 1.2) ──────
-    if not st.session_state['_login_logged']:
-        st.session_state['audit_log'].append({
-            'event': 'login',
-            'user':  st.session_state['current_user'].get('username','—'),
-            'time':  time.strftime('%Y-%m-%d %H:%M:%S')
+    # On first entry after login — clear any stale dataset
+    if not st.session_state["_login_logged"]:
+        st.session_state["audit_log"].append({
+            "event": "login",
+            "user":  st.session_state["current_user"].get("username", "—"),
+            "time":  time.strftime("%Y-%m-%d %H:%M:%S")
         })
-        st.session_state['_login_logged'] = True
-
-        # ── Clear any stale dataset from a previous session ──
-        # The hydration blocks in page_upload / page_analysis /
-        # page_trends restore data from SQLite whenever analyzed_df
-        # is None — so clearing here means the user always starts
-        # with a clean slate and must explicitly load or upload a
-        # batch before any data appears on the dashboard.
-        st.session_state['analyzed_df']    = None
-        st.session_state['active_batch_id'] = None
+        st.session_state["_login_logged"]  = True
+        st.session_state["analyzed_df"]    = None
+        st.session_state["active_batch_id"] = None
 
     _render_sidebar()
 
-    # ── Route to active page ──────────────────────────────
-    page = st.session_state['active_page']
+    page = st.session_state["active_page"]
 
-    if page == 'Dashboard':
-        page_dashboard.show_page()       # SIMS_03
-
-    elif page == 'Upload':
-        page_upload.show_page(logic)     # SIMS_04 → SIMS_07
-
-    elif page == 'Analysis':
-        page_analysis.show_page()        # SIMS_08 + SIMS_09
-
-    elif page == 'Trends':
-        page_trends.show_page()          # FR 2.3
-
-    elif page == 'History':
-        page_history.show_page()         # Past analysis batches
+    if   page == "Dashboard": page_dashboard.show_page()
+    elif page == "Upload":    page_upload.show_page(logic)
+    elif page == "Analysis":  page_analysis.show_page()
+    elif page == "Trends":    page_trends.show_page()
+    elif page == "History":   page_history.show_page()

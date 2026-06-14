@@ -1,81 +1,133 @@
 """
-database.py — SIMS SQLite Database Layer
-Provides persistent storage for:
-  • users          (SIMS_01 Sign Up, SIMS_02 Login)
-  • analyzed_posts (SIMS_07 Save Analysis Results)
-  • audit_log      (NFR 1.2 Security audit trail)
+database.py — SIMS Cloud Database Layer (Supabase)
+Replaces the local SQLite file with a cloud PostgreSQL database
+hosted on Supabase (https://supabase.com).
 
-All functions use bcrypt for password hashing (NFR 1.1).
+All function signatures are IDENTICAL to the old SQLite version
+so no other file in the project needs to change.
+
+Tables required in Supabase (create via SQL Editor):
+    users, analyzed_posts, audit_log
+See README_DEPLOYMENT.md for the full CREATE TABLE SQL.
+
+Environment variables required (put in .env file):
+    SUPABASE_URL = https://your-project-id.supabase.co
+    SUPABASE_KEY = your-anon-public-key
+
+Security (NFR 1.1):
+    Passwords are hashed with bcrypt before storage.
+    The anon key only allows row-level operations — it cannot
+    drop tables or access other projects.
 """
 
-import sqlite3
 import os
-import json
 import time
+import hashlib
 from datetime import datetime
-from pathlib import Path
 
+# ── Load .env file if present (works locally and on Colab) ──
 try:
-    import bcrypt
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed — env vars must be set manually
+
+# ── Supabase client ──────────────────────────────────────────
+try:
+    from supabase import create_client, Client
+    _SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+    _SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+    if not _SUPABASE_URL or not _SUPABASE_KEY:
+        raise ValueError(
+            "SUPABASE_URL and SUPABASE_KEY environment variables are not set.\n"
+            "Create a .env file in your project folder with:\n"
+            "  SUPABASE_URL=https://your-project.supabase.co\n"
+            "  SUPABASE_KEY=your-anon-key"
+        )
+    _sb: Client = create_client(_SUPABASE_URL, _SUPABASE_KEY)
+    _SUPABASE_OK = True
+    print("[DB] Connected to Supabase cloud database.")
+except Exception as e:
+    _SUPABASE_OK = False
+    print(f"[DB] WARNING: Supabase not available — {e}")
+    print("[DB] Falling back to local SQLite (sims.db).")
+
+
+# ════════════════════════════════════════════════════════════
+#  SQLITE FALLBACK
+#  If Supabase is not configured, fall back to local SQLite
+#  so the app still works on localhost without internet.
+# ════════════════════════════════════════════════════════════
+if not _SUPABASE_OK:
+    import sqlite3
+    from pathlib import Path
+
+    _DB_PATH = Path(__file__).parent / "sims.db"
+
+    def _get_conn():
+        conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+
+# ════════════════════════════════════════════════════════════
+#  PASSWORD HASHING  (NFR 1.1)
+# ════════════════════════════════════════════════════════════
+try:
+    import bcrypt as _bcrypt
     _BCRYPT = True
 except ImportError:
     _BCRYPT = False
-    import hashlib  # Fallback if bcrypt not installed
-
-# ════════════════════════════════════════════════════════════
-#  CONFIG
-# ════════════════════════════════════════════════════════════
-DB_PATH = Path(__file__).parent / "sims.db"
 
 
-# ════════════════════════════════════════════════════════════
-#  CONNECTION HELPER
-# ════════════════════════════════════════════════════════════
-def get_connection():
-    """Return a SQLite connection with foreign keys ON and row factory set."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-# ════════════════════════════════════════════════════════════
-#  PASSWORD HASHING (NFR 1.1)
-# ════════════════════════════════════════════════════════════
 def hash_password(plain: str) -> str:
-    """Hash a password using bcrypt (fallback: SHA-256 if bcrypt unavailable)."""
     if _BCRYPT:
-        return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
-    # Fallback — not production-grade but keeps the app runnable
+        return _bcrypt.hashpw(plain.encode(), _bcrypt.gensalt()).decode()
     return "sha256$" + hashlib.sha256(plain.encode()).hexdigest()
 
 
 def verify_password(plain: str, stored_hash: str) -> bool:
-    """Verify a plain password against a stored bcrypt (or SHA-256 fallback) hash."""
     if stored_hash.startswith("sha256$"):
-        # Legacy / fallback hash
-        import hashlib
         return stored_hash == "sha256$" + hashlib.sha256(plain.encode()).hexdigest()
     if _BCRYPT:
         try:
-            return bcrypt.checkpw(plain.encode(), stored_hash.encode())
+            return _bcrypt.checkpw(plain.encode(), stored_hash.encode())
         except Exception:
             return False
     return False
 
 
 # ════════════════════════════════════════════════════════════
-#  SCHEMA INITIALIZATION
+#  SCHEMA INIT — only needed for the SQLite fallback path.
+#  Supabase tables are created manually in the SQL Editor.
 # ════════════════════════════════════════════════════════════
 def init_db():
     """
-    Create all tables if they don't already exist.
-    Safe to call on every app startup.
+    Initialise the database.
+    - Supabase: prints a confirmation (tables already created in dashboard).
+    - SQLite fallback: creates tables if they don't exist.
     """
-    conn = get_connection()
-    cur  = conn.cursor()
+    if _SUPABASE_OK:
+        print("[DB] Supabase — tables managed via Supabase SQL Editor.")
+        # Seed default admin if no users exist
+        try:
+            res = _sb.table("users").select("id").limit(1).execute()
+            if not res.data:
+                _sb.table("users").insert({
+                    "username": "admin",
+                    "email": "admin@sims.com",
+                    "password_hash": hash_password("12345678"),
+                    "role": "Analyst"
+                }).execute()
+                print("[DB] Seeded default admin account (admin / 12345678)")
+        except Exception as e:
+            print(f"[DB] Could not check/seed admin: {e}")
+        return
 
-    # ── users table (SIMS_01, SIMS_02) ──────────────────────
+    # ── SQLite fallback schema ──────────────────────────────
+    conn = _get_conn()
+    cur  = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,19 +138,6 @@ def init_db():
             created_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Migration safety: ensure email uniqueness is enforced even on
-    # existing databases that were created before this constraint was added.
-    # CREATE INDEX IF NOT EXISTS is safe to run repeatedly.
-    try:
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email)")
-    except sqlite3.IntegrityError:
-        # Existing rows already violate uniqueness — surface a clear message in the log.
-        # The app continues; the next create_user() will still hit the UNIQUE check.
-        print("[DB] Warning: existing users share emails; unique index could not be applied. "
-              "Consider cleaning up duplicate emails.")
-
-    # ── analyzed_posts table (SIMS_07) ──────────────────────
-    # FR 1.3: store post, risk score, risk category, timestamp
     cur.execute("""
         CREATE TABLE IF NOT EXISTS analyzed_posts (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,22 +150,13 @@ def init_db():
             danger_score   REAL,
             source         TEXT,
             post_timestamp TEXT,
-            analyzed_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+            analyzed_at    TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Migration safety: if an older DB is missing danger_score, add it.
+    # Migration safety — add danger_score column if missing
     cur.execute("PRAGMA table_info(analyzed_posts)")
-    existing_cols = {row[1] for row in cur.fetchall()}
-    if 'danger_score' not in existing_cols:
+    if 'danger_score' not in {r[1] for r in cur.fetchall()}:
         cur.execute("ALTER TABLE analyzed_posts ADD COLUMN danger_score REAL")
-
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_category ON analyzed_posts(risk_category)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_batch    ON analyzed_posts(batch_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_date     ON analyzed_posts(analyzed_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_danger   ON analyzed_posts(danger_score)")
-
-    # ── audit_log table (NFR 1.2) ───────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,36 +167,25 @@ def init_db():
             timestamp  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_log(event_type)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(username)")
-
     conn.commit()
-
-    # ── Seed default admin account if no users exist ───────
-    cur.execute("SELECT COUNT(*) FROM users")
-    if cur.fetchone()[0] == 0:
-        cur.execute("""
-            INSERT INTO users (username, email, password_hash, role)
-            VALUES (?, ?, ?, ?)
-        """, (
-            'admin',
-            'admin@sims.com',
-            hash_password('12345678'),
-            'Analyst'
-        ))
+    # Seed admin
+    if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        cur.execute(
+            "INSERT INTO users (username,email,password_hash,role) VALUES (?,?,?,?)",
+            ('admin', 'admin@sims.com', hash_password('12345678'), 'Analyst')
+        )
         conn.commit()
         print("[DB] Seeded default admin account (admin / 12345678)")
-
     conn.close()
 
 
 # ════════════════════════════════════════════════════════════
-#  USER FUNCTIONS (SIMS_01, SIMS_02)
+#  USER FUNCTIONS  (SIMS_01 Sign Up, SIMS_02 Login)
 # ════════════════════════════════════════════════════════════
-def create_user(username: str, email: str, password: str, role: str = "Analyst") -> tuple:
+def create_user(username: str, email: str,
+                password: str, role: str = "Analyst") -> tuple:
     """
-    Create a new user account (SIMS_01).
-    Each email address can only be registered ONCE.
+    SIMS_01 — Create a new analyst account.
     Returns (success: bool, message: str).
     """
     username = username.strip().lower()
@@ -176,71 +195,83 @@ def create_user(username: str, email: str, password: str, role: str = "Analyst")
         return False, "All fields are required."
     if " " in username:
         return False, "Username cannot contain spaces."
-    if "@" not in email or "." not in email.split("@")[-1]:
+    if "@" not in email:
         return False, "Please enter a valid email address."
 
-    # ── Pre-check: email already registered? ────────────────
-    # We check email FIRST because that's the new constraint.
-    # This also gives users a clearer error than a generic IntegrityError.
-    conn = get_connection()
-    existing_email = conn.execute(
-        "SELECT username FROM users WHERE email = ?", (email,)
-    ).fetchone()
-    if existing_email:
-        conn.close()
-        msg = "The account has been taken."
-        log_event('signup', username, f'Duplicate email: {email}', success=False)
-        return False, msg
+    if _SUPABASE_OK:
+        try:
+            # Check email duplicate
+            res = _sb.table("users").select("username") \
+                     .eq("email", email).execute()
+            if res.data:
+                log_event('signup', username,
+                          f'Duplicate email: {email}', success=False)
+                return False, "This email is already registered."
 
-    # ── Pre-check: username taken? ──────────────────────────
-    existing_user = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (username,)
-    ).fetchone()
-    if existing_user:
-        conn.close()
-        msg = "Username already taken. Please choose another."
-        log_event('signup', username, msg, success=False)
-        return False, msg
+            # Check username duplicate
+            res = _sb.table("users").select("id") \
+                     .eq("username", username).execute()
+            if res.data:
+                log_event('signup', username,
+                          'Username taken', success=False)
+                return False, "Username already taken. Please choose another."
 
-    # ── Insert new account ──────────────────────────────────
-    success = False
-    msg = ""
+            # Insert new user
+            _sb.table("users").insert({
+                "username":      username,
+                "email":         email,
+                "password_hash": hash_password(password),
+                "role":          role
+            }).execute()
+
+            log_event('signup', username,
+                      f'New account created: {email}', success=True)
+            return True, f"Account created for @{username}"
+
+        except Exception as e:
+            return False, f"Database error: {e}"
+
+    # ── SQLite fallback ─────────────────────────────────────
+    conn = _get_conn()
     try:
-        conn.execute("""
-            INSERT INTO users (username, email, password_hash, role)
-            VALUES (?, ?, ?, ?)
-        """, (username, email, hash_password(password), role))
+        if conn.execute(
+                "SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+            log_event('signup', username,
+                      f'Duplicate email: {email}', success=False)
+            return False, "This email is already registered."
+        if conn.execute(
+                "SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+            log_event('signup', username,
+                      'Username taken', success=False)
+            return False, "Username already taken. Please choose another."
+        conn.execute(
+            "INSERT INTO users (username,email,password_hash,role) VALUES (?,?,?,?)",
+            (username, email, hash_password(password), role)
+        )
         conn.commit()
-        success = True
-        msg = f"Account created for @{username}"
-    except sqlite3.IntegrityError as e:
-        # Race-condition fallback (someone else inserted between our checks)
-        err_str = str(e).lower()
-        if 'email' in err_str:
-            msg = "The account has been taken."
-        elif 'username' in err_str:
-            msg = "Username already taken. Please choose another."
-        else:
-            msg = f"Account could not be created: {e}"
+        log_event('signup', username,
+                  f'New account: {email}', success=True)
+        return True, f"Account created for @{username}"
     except Exception as e:
-        msg = f"Database error: {e}"
+        return False, f"Database error: {e}"
     finally:
         conn.close()
 
-    # Log AFTER closing the connection (prevents lock)
-    if success:
-        log_event('signup', username, f'New account created: {email}', success=True)
-    else:
-        log_event('signup', username, msg, success=False)
-    return success, msg
-    return success, msg
-
 
 def get_user(username: str) -> dict | None:
-    """Fetch a user by username. Returns dict or None."""
-    conn = get_connection()
+    """Fetch a user record by username. Returns dict or None."""
+    username = username.strip().lower()
+    if _SUPABASE_OK:
+        try:
+            res = _sb.table("users").select("*") \
+                     .eq("username", username).execute()
+            return res.data[0] if res.data else None
+        except Exception:
+            return None
+
+    conn = _get_conn()
     row = conn.execute(
-        "SELECT * FROM users WHERE username = ?", (username.strip().lower(),)
+        "SELECT * FROM users WHERE username=?", (username,)
     ).fetchone()
     conn.close()
     return dict(row) if row else None
@@ -248,144 +279,195 @@ def get_user(username: str) -> dict | None:
 
 def authenticate(username: str, password: str) -> dict | None:
     """
-    Authenticate user (SIMS_02).
-    Returns user dict on success, None on failure.
+    SIMS_02 — Authenticate a user.
+    Returns user dict (without password hash) on success, None on failure.
     Logs every attempt (NFR 1.2).
     """
     username = username.strip().lower()
     user = get_user(username)
 
-    if user and verify_password(password, user['password_hash']):
-        log_event('login', username, 'Successful login', success=True)
-        # Don't return the hash
-        user.pop('password_hash', None)
-        return user
+    if user:
+        # Supabase stores 'password_hash'; SQLite also stores 'password_hash'
+        stored = user.get('password_hash', '')
+        if verify_password(password, stored):
+            log_event('login', username, 'Successful login', success=True)
+            user.pop('password_hash', None)
+            return user
 
     log_event('login', username, 'Invalid credentials', success=False)
     return None
 
 
 # ════════════════════════════════════════════════════════════
-#  ANALYZED POSTS FUNCTIONS (SIMS_07, SIMS_08, SIMS_09)
+#  ANALYZED POSTS FUNCTIONS  (SIMS_07, SIMS_08, SIMS_09)
 # ════════════════════════════════════════════════════════════
-def save_analysis_batch(df, user_id: int | None = None) -> str:
+def save_analysis_batch(df, user_id=None) -> str:
     """
-    SIMS_07 — Save a batch of analyzed posts.
-    Expects df with columns: text, Preprocessed, Risk_Score, Risk_Category
-    Optional: source, timestamp
-    Returns the batch_id used.
+    SIMS_07 — Save a batch of analyzed posts to the database.
+    Returns the batch_id string.
     """
+    import pandas as pd
     batch_id = f"batch_{int(time.time())}"
-    conn = get_connection()
-    cur  = conn.cursor()
 
     rows = []
     for _, r in df.iterrows():
-        # Danger_Score is optional — if missing, default to None (column is nullable)
-        danger_val = r.get('Danger_Score', None)
+        danger = r.get('Danger_Score', None)
         try:
-            danger_val = float(danger_val) if danger_val is not None else None
+            danger = float(danger) if danger is not None else None
         except (ValueError, TypeError):
-            danger_val = None
+            danger = None
 
-        rows.append((
-            batch_id,
-            user_id,
-            str(r.get('text', '')),
-            str(r.get('Preprocessed', '')),
-            float(r.get('Risk_Score', 0.0)),
-            str(r.get('Risk_Category', 'Low Risk')),
-            danger_val,
-            str(r.get('source', '')) if 'source' in r else None,
-            str(r.get('timestamp', '')) if 'timestamp' in r else None,
-        ))
+        rows.append({
+            "batch_id":      batch_id,
+            "user_id":       user_id,
+            "original_text": str(r.get('text', '')),
+            "preprocessed":  str(r.get('Preprocessed', '')),
+            "risk_score":    float(r.get('Risk_Score', 0.0)),
+            "risk_category": str(r.get('Risk_Category', 'Low Risk')),
+            "danger_score":  danger,
+            "source":        str(r.get('source', '')) if 'source' in r else None,
+            "post_timestamp":str(r.get('timestamp', '')) if 'timestamp' in r else None,
+        })
 
-    cur.executemany("""
-        INSERT INTO analyzed_posts (
-            batch_id, user_id, original_text, preprocessed,
-            risk_score, risk_category, danger_score, source, post_timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    if _SUPABASE_OK:
+        try:
+            # Supabase insert in chunks of 500 to avoid payload size limits
+            chunk_size = 500
+            for i in range(0, len(rows), chunk_size):
+                _sb.table("analyzed_posts") \
+                   .insert(rows[i:i+chunk_size]).execute()
+        except Exception as e:
+            print(f"[DB] save_analysis_batch error: {e}")
+        return batch_id
+
+    # ── SQLite fallback ─────────────────────────────────────
+    conn = _get_conn()
+    conn.executemany("""
+        INSERT INTO analyzed_posts
+          (batch_id, user_id, original_text, preprocessed,
+           risk_score, risk_category, danger_score, source, post_timestamp)
+        VALUES
+          (:batch_id,:user_id,:original_text,:preprocessed,
+           :risk_score,:risk_category,:danger_score,:source,:post_timestamp)
     """, rows)
-
     conn.commit()
     conn.close()
     return batch_id
 
 
-def get_all_posts(limit: int | None = None):
-    """
-    SIMS_08 — Retrieve all analyzed posts as a pandas DataFrame.
-    """
+def get_all_posts(limit=None):
+    """SIMS_08 — Retrieve all analyzed posts as a pandas DataFrame."""
     import pandas as pd
-    conn = get_connection()
-    q = """
+
+    if _SUPABASE_OK:
+        try:
+            q = _sb.table("analyzed_posts").select(
+                "id,batch_id,original_text,preprocessed,"
+                "risk_score,risk_category,danger_score,"
+                "source,post_timestamp,analyzed_at"
+            ).order("analyzed_at", desc=True)
+            if limit:
+                q = q.limit(int(limit))
+            res = q.execute()
+            df = pd.DataFrame(res.data)
+            if df.empty:
+                return df
+            return df.rename(columns={
+                "original_text": "text",
+                "preprocessed":  "Preprocessed",
+                "risk_score":    "Risk_Score",
+                "risk_category": "Risk_Category",
+                "danger_score":  "Danger_Score",
+            })
+        except Exception as e:
+            print(f"[DB] get_all_posts error: {e}")
+            return pd.DataFrame()
+
+    # SQLite fallback
+    conn = _get_conn()
+    df = pd.read_sql_query("""
         SELECT id, batch_id, original_text AS text,
                preprocessed AS Preprocessed,
-               risk_score   AS Risk_Score,
+               risk_score AS Risk_Score,
                risk_category AS Risk_Category,
                danger_score AS Danger_Score,
                source, post_timestamp, analyzed_at
-        FROM analyzed_posts
-        ORDER BY analyzed_at DESC
-    """
-    if limit:
-        q += f" LIMIT {int(limit)}"
-    df = pd.read_sql_query(q, conn)
+        FROM analyzed_posts ORDER BY analyzed_at DESC
+    """ + (f" LIMIT {int(limit)}" if limit else ""), conn)
     conn.close()
     return df
 
 
-def get_posts_filtered(risk_category: str = None,
-                       min_score: float = 0.0,
-                       keyword: str = None,
-                       date_from: str = None,
-                       date_to: str = None,
-                       min_danger: float = 0.0):
-    """
-    SIMS_08 — Filter analyzed posts by criteria.
-    Returns a pandas DataFrame.
-
-    min_danger filters by the weighted danger score (0.0 safe → 1.0 high risk).
-    min_score filters by the model's confidence in its own prediction.
-    """
+def get_posts_filtered(risk_category=None, min_score=0.0,
+                       keyword=None, date_from=None,
+                       date_to=None, min_danger=0.0):
+    """SIMS_08 — Filter analyzed posts."""
     import pandas as pd
-    conn = get_connection()
-    where, params = [], []
 
+    if _SUPABASE_OK:
+        try:
+            q = _sb.table("analyzed_posts").select(
+                "id,batch_id,original_text,preprocessed,"
+                "risk_score,risk_category,danger_score,"
+                "source,post_timestamp,analyzed_at"
+            )
+            if risk_category and risk_category != "All":
+                q = q.eq("risk_category", risk_category)
+            if min_score and min_score > 0:
+                q = q.gte("risk_score", min_score)
+            if min_danger and min_danger > 0:
+                q = q.gte("danger_score", min_danger)
+            if date_from:
+                q = q.gte("analyzed_at", date_from)
+            if date_to:
+                q = q.lte("analyzed_at", date_to)
+            q = q.order("analyzed_at", desc=True)
+            res = q.execute()
+            df = pd.DataFrame(res.data)
+            if df.empty:
+                return df
+            df = df.rename(columns={
+                "original_text": "text",
+                "preprocessed":  "Preprocessed",
+                "risk_score":    "Risk_Score",
+                "risk_category": "Risk_Category",
+                "danger_score":  "Danger_Score",
+            })
+            # Keyword filter in Python (Supabase free tier has limited ILIKE)
+            if keyword and keyword.strip():
+                df = df[df['text'].str.contains(
+                    keyword.strip(), case=False, na=False)]
+            return df
+        except Exception as e:
+            print(f"[DB] get_posts_filtered error: {e}")
+            return pd.DataFrame()
+
+    # SQLite fallback
+    conn = _get_conn()
+    where, params = [], []
     if risk_category and risk_category != "All":
-        where.append("risk_category = ?")
-        params.append(risk_category)
-    if min_score and min_score > 0:
-        where.append("risk_score >= ?")
-        params.append(min_score)
-    if min_danger and min_danger > 0:
-        # Treat NULL danger_score as 0 so legacy rows (pre-migration) aren't
-        # accidentally surfaced when the user wants high-danger posts only.
-        where.append("COALESCE(danger_score, 0) >= ?")
-        params.append(min_danger)
+        where.append("risk_category=?"); params.append(risk_category)
+    if min_score > 0:
+        where.append("risk_score>=?");   params.append(min_score)
+    if min_danger > 0:
+        where.append("COALESCE(danger_score,0)>=?"); params.append(min_danger)
     if keyword and keyword.strip():
         where.append("original_text LIKE ?")
         params.append(f"%{keyword.strip()}%")
     if date_from:
-        where.append("analyzed_at >= ?")
-        params.append(date_from)
+        where.append("analyzed_at>=?"); params.append(date_from)
     if date_to:
-        where.append("analyzed_at <= ?")
-        params.append(date_to)
-
-    q = """
-        SELECT id, batch_id, original_text AS text,
-               preprocessed AS Preprocessed,
-               risk_score   AS Risk_Score,
-               risk_category AS Risk_Category,
-               danger_score AS Danger_Score,
-               source, post_timestamp, analyzed_at
-        FROM analyzed_posts
-    """
+        where.append("analyzed_at<=?"); params.append(date_to)
+    q = """SELECT id,batch_id,original_text AS text,
+                  preprocessed AS Preprocessed,
+                  risk_score AS Risk_Score,
+                  risk_category AS Risk_Category,
+                  danger_score AS Danger_Score,
+                  source,post_timestamp,analyzed_at
+           FROM analyzed_posts"""
     if where:
         q += " WHERE " + " AND ".join(where)
     q += " ORDER BY analyzed_at DESC"
-
     df = pd.read_sql_query(q, conn, params=params)
     conn.close()
     return df
@@ -393,63 +475,114 @@ def get_posts_filtered(risk_category: str = None,
 
 def get_post_stats() -> dict:
     """Return summary counts for the dashboard KPIs."""
-    conn = get_connection()
-    cur  = conn.cursor()
+    if _SUPABASE_OK:
+        try:
+            res = _sb.table("analyzed_posts").select(
+                "risk_category,risk_score"
+            ).execute()
+            import pandas as pd
+            df = pd.DataFrame(res.data)
+            if df.empty:
+                return {'total':0,'high':0,'moderate':0,'low':0,'avg_score':0.0}
+            vc = df['risk_category'].value_counts().to_dict()
+            return {
+                'total':    len(df),
+                'high':     vc.get('High Risk', 0),
+                'moderate': vc.get('Moderate Risk', 0),
+                'low':      vc.get('Low Risk', 0),
+                'avg_score': round(df['risk_score'].mean(), 4),
+            }
+        except Exception as e:
+            print(f"[DB] get_post_stats error: {e}")
+            return {'total':0,'high':0,'moderate':0,'low':0,'avg_score':0.0}
 
-    cur.execute("SELECT COUNT(*) FROM analyzed_posts")
-    total = cur.fetchone()[0]
-
-    cur.execute("""
-        SELECT risk_category, COUNT(*)
-        FROM analyzed_posts
-        GROUP BY risk_category
-    """)
-    by_cat = {row[0]: row[1] for row in cur.fetchall()}
-
-    cur.execute("SELECT AVG(risk_score) FROM analyzed_posts")
-    avg = cur.fetchone()[0] or 0.0
-
+    conn = _get_conn()
+    total = conn.execute("SELECT COUNT(*) FROM analyzed_posts").fetchone()[0]
+    by_cat = {r[0]:r[1] for r in conn.execute(
+        "SELECT risk_category,COUNT(*) FROM analyzed_posts GROUP BY risk_category"
+    ).fetchall()}
+    avg = conn.execute(
+        "SELECT AVG(risk_score) FROM analyzed_posts").fetchone()[0] or 0.0
     conn.close()
     return {
-        'total':    total,
-        'high':     by_cat.get('High Risk', 0),
-        'moderate': by_cat.get('Moderate Risk', 0),
-        'low':      by_cat.get('Low Risk', 0),
-        'avg_score': round(avg, 4),
+        'total':total,
+        'high':by_cat.get('High Risk',0),
+        'moderate':by_cat.get('Moderate Risk',0),
+        'low':by_cat.get('Low Risk',0),
+        'avg_score':round(avg,4),
     }
 
 
 def clear_all_posts():
-    """Delete all analyzed posts (for Clear All button)."""
-    conn = get_connection()
+    """Delete all analyzed posts."""
+    if _SUPABASE_OK:
+        try:
+            _sb.table("analyzed_posts").delete().neq("id", 0).execute()
+        except Exception as e:
+            print(f"[DB] clear_all_posts error: {e}")
+        return
+    conn = _get_conn()
     conn.execute("DELETE FROM analyzed_posts")
     conn.commit()
     conn.close()
 
 
 # ════════════════════════════════════════════════════════════
-#  HISTORY FUNCTIONS — group analyzed posts by batch
+#  BATCH HISTORY FUNCTIONS
 # ════════════════════════════════════════════════════════════
 def get_batch_history():
-    """
-    Return a DataFrame summarising each saved analysis batch.
-    One row per batch: batch_id, when it ran, who ran it, totals per category.
-    """
+    """Return a DataFrame summarising each saved analysis batch."""
     import pandas as pd
-    conn = get_connection()
+
+    if _SUPABASE_OK:
+        try:
+            res = _sb.table("analyzed_posts").select(
+                "batch_id,user_id,risk_category,risk_score,analyzed_at"
+            ).order("analyzed_at", desc=True).execute()
+            df = pd.DataFrame(res.data)
+            if df.empty:
+                return pd.DataFrame(columns=[
+                    'batch_id','analyzed_at','analyst',
+                    'total_posts','high','moderate','low',
+                    'avg_score','max_score'
+                ])
+            # Aggregate in Python
+            agg = []
+            for batch_id, grp in df.groupby('batch_id'):
+                agg.append({
+                    'batch_id':    batch_id,
+                    'analyzed_at': grp['analyzed_at'].min(),
+                    'analyst':     '—',
+                    'total_posts': len(grp),
+                    'high':    (grp['risk_category']=='High Risk').sum(),
+                    'moderate':(grp['risk_category']=='Moderate Risk').sum(),
+                    'low':     (grp['risk_category']=='Low Risk').sum(),
+                    'avg_score':round(grp['risk_score'].mean(),4),
+                    'max_score':round(grp['risk_score'].max(),4),
+                })
+            result = pd.DataFrame(agg).sort_values(
+                'analyzed_at', ascending=False).reset_index(drop=True)
+            return result
+        except Exception as e:
+            print(f"[DB] get_batch_history error: {e}")
+            return pd.DataFrame()
+
+    # SQLite fallback
+    import pandas as pd
+    conn = _get_conn()
     df = pd.read_sql_query("""
         SELECT
             ap.batch_id,
             MIN(ap.analyzed_at) AS analyzed_at,
-            COALESCE(u.username, '—') AS analyst,
+            COALESCE(u.username,'—') AS analyst,
             COUNT(*) AS total_posts,
-            SUM(CASE WHEN ap.risk_category = 'High Risk' THEN 1 ELSE 0 END)     AS high,
-            SUM(CASE WHEN ap.risk_category = 'Moderate Risk' THEN 1 ELSE 0 END) AS moderate,
-            SUM(CASE WHEN ap.risk_category = 'Low Risk' THEN 1 ELSE 0 END)      AS low,
-            ROUND(AVG(ap.risk_score), 4) AS avg_score,
-            ROUND(MAX(ap.risk_score), 4) AS max_score
+            SUM(CASE WHEN ap.risk_category='High Risk' THEN 1 ELSE 0 END) AS high,
+            SUM(CASE WHEN ap.risk_category='Moderate Risk' THEN 1 ELSE 0 END) AS moderate,
+            SUM(CASE WHEN ap.risk_category='Low Risk' THEN 1 ELSE 0 END) AS low,
+            ROUND(AVG(ap.risk_score),4) AS avg_score,
+            ROUND(MAX(ap.risk_score),4) AS max_score
         FROM analyzed_posts ap
-        LEFT JOIN users u ON ap.user_id = u.id
+        LEFT JOIN users u ON ap.user_id=u.id
         GROUP BY ap.batch_id
         ORDER BY analyzed_at DESC
     """, conn)
@@ -458,44 +591,83 @@ def get_batch_history():
 
 
 def get_batch_posts(batch_id: str):
-    """Return all posts belonging to a single batch."""
+    """Return all posts belonging to a single batch as a DataFrame."""
     import pandas as pd
-    conn = get_connection()
+
+    if _SUPABASE_OK:
+        try:
+            res = _sb.table("analyzed_posts").select(
+                "id,original_text,preprocessed,"
+                "risk_score,risk_category,danger_score,"
+                "source,post_timestamp,analyzed_at"
+            ).eq("batch_id", batch_id) \
+             .order("danger_score", desc=True).execute()
+            df = pd.DataFrame(res.data)
+            if df.empty:
+                return df
+            return df.rename(columns={
+                "original_text": "text",
+                "preprocessed":  "Preprocessed",
+                "risk_score":    "Risk_Score",
+                "risk_category": "Risk_Category",
+                "danger_score":  "Danger_Score",
+            })
+        except Exception as e:
+            print(f"[DB] get_batch_posts error: {e}")
+            return pd.DataFrame()
+
+    conn = _get_conn()
     df = pd.read_sql_query("""
         SELECT id,
-               original_text  AS text,
-               preprocessed   AS Preprocessed,
-               risk_score     AS Risk_Score,
-               risk_category  AS Risk_Category,
-               danger_score   AS Danger_Score,
+               original_text AS text, preprocessed AS Preprocessed,
+               risk_score AS Risk_Score, risk_category AS Risk_Category,
+               danger_score AS Danger_Score,
                source, post_timestamp, analyzed_at
-        FROM analyzed_posts
-        WHERE batch_id = ?
-        ORDER BY COALESCE(danger_score, 0) DESC, risk_score DESC
+        FROM analyzed_posts WHERE batch_id=?
+        ORDER BY COALESCE(danger_score,0) DESC, risk_score DESC
     """, conn, params=(batch_id,))
     conn.close()
     return df
 
 
 def delete_batch(batch_id: str):
-    """Delete a single batch from history."""
-    conn = get_connection()
-    conn.execute("DELETE FROM analyzed_posts WHERE batch_id = ?", (batch_id,))
+    """Delete all posts belonging to a batch."""
+    if _SUPABASE_OK:
+        try:
+            _sb.table("analyzed_posts") \
+               .delete().eq("batch_id", batch_id).execute()
+        except Exception as e:
+            print(f"[DB] delete_batch error: {e}")
+        return
+    conn = _get_conn()
+    conn.execute("DELETE FROM analyzed_posts WHERE batch_id=?", (batch_id,))
     conn.commit()
     conn.close()
 
 
 # ════════════════════════════════════════════════════════════
-#  AUDIT LOG FUNCTIONS (NFR 1.2)
+#  AUDIT LOG FUNCTIONS  (NFR 1.2)
 # ════════════════════════════════════════════════════════════
 def log_event(event_type: str, username: str = None,
               details: str = "", success: bool = True):
-    """Append an event to the audit log."""
-    conn = get_connection()
-    conn.execute("""
-        INSERT INTO audit_log (event_type, username, details, success)
-        VALUES (?, ?, ?, ?)
-    """, (event_type, username, details, 1 if success else 0))
+    """Append a security event to the audit log."""
+    if _SUPABASE_OK:
+        try:
+            _sb.table("audit_log").insert({
+                "event_type": event_type,
+                "username":   username,
+                "details":    details,
+                "success":    success,
+            }).execute()
+        except Exception as e:
+            print(f"[DB] log_event error: {e}")
+        return
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO audit_log (event_type,username,details,success) "
+        "VALUES (?,?,?,?)",
+        (event_type, username, details, 1 if success else 0)
+    )
     conn.commit()
     conn.close()
 
@@ -503,12 +675,21 @@ def log_event(event_type: str, username: str = None,
 def get_audit_log(limit: int = 500):
     """Fetch the audit log as a pandas DataFrame."""
     import pandas as pd
-    conn = get_connection()
+
+    if _SUPABASE_OK:
+        try:
+            res = _sb.table("audit_log").select(
+                "timestamp,event_type,username,details,success"
+            ).order("id", desc=True).limit(int(limit)).execute()
+            return pd.DataFrame(res.data)
+        except Exception as e:
+            print(f"[DB] get_audit_log error: {e}")
+            return pd.DataFrame()
+
+    conn = _get_conn()
     df = pd.read_sql_query(f"""
-        SELECT timestamp, event_type, username, details, success
-        FROM audit_log
-        ORDER BY id DESC
-        LIMIT {int(limit)}
+        SELECT timestamp,event_type,username,details,success
+        FROM audit_log ORDER BY id DESC LIMIT {int(limit)}
     """, conn)
     conn.close()
     return df
